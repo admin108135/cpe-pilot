@@ -278,6 +278,8 @@ class CpeClient {
   Map<String, String> get _headers {
     final h = <String, String>{
       'Referer': '$baseUrl/html/index.html',
+      'Origin': baseUrl,
+      'Accept': '*/*',
       'User-Agent': _ua,
     };
     if (cookie.isNotEmpty) h['Cookie'] = cookie;
@@ -303,9 +305,8 @@ class CpeClient {
     final raw = r.headers['set-cookie'];
     if (raw == null || raw.isEmpty) return;
     final pair = raw.split(';').first.trim();
-    if (pair.contains('=') && !pair.startsWith('expires')) {
-      cookie = pair;
-    }
+    // 只接受会话 cookie，避免被无关 Set-Cookie 覆盖
+    if (pair.startsWith('SessionID=')) cookie = pair;
   }
 
   Future<http.Response?> _rawGet(String path,
@@ -356,7 +357,28 @@ class CpeClient {
 
   Future<void> initSession() async {
     await _rawGet('/html/index.html', timeout: const Duration(seconds: 4));
-    await refreshToken();
+    final ok = await refreshSesTok();
+    if (!ok) {
+      _log('SesTokInfo 未取到，回退 webserver/token');
+      await refreshToken();
+    }
+  }
+
+  /// 与 cpeultra 一致：SesTokInfo 同时给出会话 Cookie 与 CSRF token
+  Future<bool> refreshSesTok() async {
+    final r = await _rawGet('/api/webserver/SesTokInfo');
+    if (r == null || r.statusCode != 200) return false;
+    final d = tryParseXml(r.body);
+    final ses = tagOf(d, 'SesInfo') ?? '';
+    final tok = tagOf(d, 'TokInfo') ?? '';
+    if (ses.isNotEmpty) {
+      cookie = ses.startsWith('SessionID=')
+          ? ses.split(';').first.trim()
+          : 'SessionID=$ses';
+      _log('会话 cookie 长度 ${cookie.length}');
+    }
+    if (tok.isNotEmpty) token = trimToken(tok);
+    return tok.isNotEmpty;
   }
 
   Future<void> refreshToken() async {
@@ -392,19 +414,28 @@ class CpeClient {
     final attempts = <String>[];
 
     // 1. cpeultra 同款：标准 SCRAM + 精简请求体（logintype=1）
-    final r1 = await _scramAttempt(password, modernBody: true, variant: false);
-    attempts.add('新版SCRAM=${r1 ?? '成功'}');
+    final r1 = await _scramAttempt(password,
+        modernBody: true, loginflag: false, variant: false);
+    attempts.add('照抄新版=${r1 ?? '成功'}');
     if (r1 == null) return _loginDone(attempts);
 
-    // 2. 标准 SCRAM + 旧请求体（username/password_type=4）
-    final r2 = await _scramAttempt(password, modernBody: false, variant: false);
-    attempts.add('标准SCRAM=${r2 ?? '成功'}');
+    // 2. 新版请求体 + 带 loginflag 的挑战
+    final r2 = await _scramAttempt(password,
+        modernBody: true, loginflag: true, variant: false);
+    attempts.add('新版+loginflag=${r2 ?? '成功'}');
     if (r2 == null) return _loginDone(attempts);
 
-    // 3. 旧写法 proof + 旧请求体
-    final r3 = await _scramAttempt(password, modernBody: false, variant: true);
-    attempts.add('旧proof=${r3 ?? '成功'}');
+    // 3. 标准 proof + 旧请求体
+    final r3 = await _scramAttempt(password,
+        modernBody: false, loginflag: true, variant: false);
+    attempts.add('旧请求体=${r3 ?? '成功'}');
     if (r3 == null) return _loginDone(attempts);
+
+    // 4. 旧写法 proof + 旧请求体（兼容 INS2）
+    final r3b = await _scramAttempt(password,
+        modernBody: false, loginflag: true, variant: true);
+    attempts.add('旧proof=${r3b ?? '成功'}');
+    if (r3b == null) return _loginDone(attempts);
 
     // 4. 老式 /api/user/login
     final r4 = await _legacyLogin(password);
@@ -412,7 +443,7 @@ class CpeClient {
     if (r4 == null) return _loginDone(attempts);
 
     loggedIn = false;
-    lastError = '四种方式均被拒（${attempts.join('、')}）'
+    lastError = '五种方式均被拒（${attempts.join('、')}）'
         '·如浏览器也登不上，就是管理密码不对';
     _log(lastError);
     return false;
@@ -427,13 +458,16 @@ class CpeClient {
 
   /// 返回 null 表示成功，否则返回失败原因（错误码/状态）
   Future<String?> _scramAttempt(String password,
-      {required bool modernBody, required bool variant}) async {
+      {required bool modernBody,
+      required bool loginflag,
+      required bool variant}) async {
     final firstNonce = randomNonce();
     final challengeBody = '<?xml version="1.0" encoding="UTF-8"?><request>'
         '<username>${escXml(user)}</username>'
         '<firstnonce>$firstNonce</firstnonce>'
         '<mode>1</mode>'
-        '<loginflag>2</loginflag></request>';
+        '${loginflag ? '<loginflag>2</loginflag>' : ''}'
+        '</request>';
     final challenge =
         await _rawPost('/api/user/challenge_login', challengeBody);
     if (challenge == null) return '无响应';
@@ -471,9 +505,8 @@ class CpeClient {
     if (auth.statusCode == 200 && !body.contains('<code>')) {
       final sig = computeServerSignature(
           password, salt, iterations, firstNonce, serverNonce);
-      final got = tagOf(tryParseXml(body), 'serversignature');
-      _log('服务器签名 ${got == sig ? '校验通过' : '不一致'}');
-      await refreshToken();
+      final got = tagOf(tryParseXml(body), 'serversignature') ?? '';
+      _log('服务器签名 ${got.isEmpty ? '缺失' : (got.toLowerCase() == sig ? '校验通过' : '不一致')}');
       return null;
     }
     final code = tagOf(tryParseXml(body), 'code');
