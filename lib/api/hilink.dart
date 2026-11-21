@@ -144,6 +144,43 @@ class NetModeInfo {
 // HiLink 客户端
 // ---------------------------------------------------------------------------
 
+/// 一条完整抓包记录（请求 + 响应）
+class HttpCapture {
+  HttpCapture({
+    required this.method,
+    required this.path,
+    required this.reqBody,
+    required this.status,
+    required this.respBody,
+    required this.ms,
+    required this.error,
+    required this.at,
+  });
+
+  final String method;
+  final String path;
+  final String reqBody;
+  final int status;
+  final String respBody;
+  final int ms;
+  final String error;
+  final DateTime at;
+
+  bool get ok => status >= 200 && status < 400;
+  String get statusLabel => status == 0 ? 'ERR' : '$status';
+  String get time =>
+      '${at.hour.toString().padLeft(2, '0')}:${at.minute.toString().padLeft(2, '0')}:${at.second.toString().padLeft(2, '0')}';
+
+  String dump() {
+    final b = StringBuffer();
+    b.writeln('### $time ${method} $path → $statusLabel ${ms}ms');
+    if (error.isNotEmpty) b.writeln('ERR: $error');
+    if (reqBody.isNotEmpty) b.writeln('REQ: $reqBody');
+    if (respBody.isNotEmpty) b.writeln('RESP: $respBody');
+    return b.toString();
+  }
+}
+
 class CpeClient {
   CpeClient({required this.host, this.useHttps = false});
 
@@ -170,6 +207,43 @@ class CpeClient {
   }
 
   String get traceText => trace.join('\n');
+
+  // ---- 抓包 ---------------------------------------------------------------
+  bool captureOn = true;
+  final List<HttpCapture> captures = [];
+
+  static String _clip(String s, [int n = 3000]) =>
+      s.length <= n ? s : '${s.substring(0, n)}\n…(已截断，共 ${s.length} 字符)';
+
+  void _cap(String method, String path, String req, int status, String resp,
+      int ms, String error) {
+    if (!captureOn) return;
+    if (req.length > 1200) req = _clip(req, 1200);
+    captures.add(HttpCapture(
+      method: method,
+      path: path,
+      reqBody: req,
+      status: status,
+      respBody: _clip(resp),
+      ms: ms,
+      error: error,
+      at: DateTime.now(),
+    ));
+    if (captures.length > 120) captures.removeRange(0, captures.length - 120);
+  }
+
+  void clearCaptures() => captures.clear();
+
+  String get captureText {
+    final b = StringBuffer();
+    b.writeln('设备: $host  用户: $user  时间: ${DateTime.now()}');
+    b.writeln('共 ${captures.length} 条\n');
+    for (final c in captures) {
+      b.write(c.dump());
+      b.writeln();
+    }
+    return b.toString();
+  }
 
   static const _ua =
       'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
@@ -209,22 +283,28 @@ class CpeClient {
 
   Future<http.Response?> _rawGet(String path,
       {Duration timeout = const Duration(seconds: 5)}) async {
+    final sw = Stopwatch()..start();
     try {
       final r = await http
           .get(Uri.parse('$baseUrl$path'), headers: _headers)
           .timeout(timeout);
       _absorbCookie(r);
+      sw.stop();
       _log('GET $path → ${r.statusCode} | ${_head(r.body)}');
+      _cap('GET', path, '', r.statusCode, r.body, sw.elapsedMilliseconds, '');
       return r;
     } catch (e) {
+      sw.stop();
       _log('GET $path → 异常: $e');
       lastError = '$e';
+      _cap('GET', path, '', 0, '', sw.elapsedMilliseconds, '$e');
       return null;
     }
   }
 
   Future<http.Response?> _rawPost(String path, String body,
       {Duration timeout = const Duration(seconds: 8)}) async {
+    final sw = Stopwatch()..start();
     try {
       final h = Map<String, String>.from(_headers);
       h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
@@ -234,112 +314,31 @@ class CpeClient {
           .post(Uri.parse('$baseUrl$path'), headers: h, body: body)
           .timeout(timeout);
       _absorbCookie(r);
+      sw.stop();
       _log('POST $path → ${r.statusCode} | 请求 ${_head(body, 160)} | 响应 ${_head(r.body)}');
+      _cap('POST', path, body, r.statusCode, r.body, sw.elapsedMilliseconds, '');
       return r;
     } catch (e) {
+      sw.stop();
       _log('POST $path → 异常: $e');
       lastError = '$e';
+      _cap('POST', path, body, 0, '', sw.elapsedMilliseconds, '$e');
       return null;
     }
   }
 
-  // ---- 会话 ----------------------------------------------------------------
-
-  Future<void> initSession() async {
-    await _rawGet('/html/index.html', timeout: const Duration(seconds: 4));
-    await refreshToken();
+  /// 短信专项探测：GET/POST 两种取法都打一遍，判断固件是否开放短信
+  Future<void> probeSms() async {
+    _log('== 短信接口探测 ==');
+    await _rawGet('/api/sms/sms-count', timeout: const Duration(seconds: 4));
+    await _rawGet('/api/sms/sms-list', timeout: const Duration(seconds: 4));
+    await _rawPost(
+        '/api/sms/sms-list',
+        '<request><PageIndex>1</PageIndex><ReadCount>20</ReadCount>'
+            '<BoxType>1</BoxType><SortType>0</SortType></request>',
+        timeout: const Duration(seconds: 6));
   }
 
-  Future<void> refreshToken() async {
-    final r1 = await _rawGet('/api/webserver/token');
-    if (r1 != null && r1.statusCode == 200) {
-      final t = tagOf(tryParseXml(r1.body), 'token');
-      if (t != null && t.isNotEmpty) token = trimToken(t);
-    }
-    if (token.isEmpty) {
-      final r2 = await _rawGet('/api/webserver/SesTokInfo');
-      if (r2 != null && r2.statusCode == 200) {
-        final d = tryParseXml(r2.body);
-        final ses = tagOf(d, 'SesInfo');
-        final tok = tagOf(d, 'TokInfo');
-        if (ses != null && ses.isNotEmpty && cookie.isEmpty) cookie = ses;
-        if (tok != null && tok.isNotEmpty) token = tok;
-      }
-    }
-  }
-
-  Future<bool> login(String userName, String password) async {
-    user = userName.isEmpty ? 'admin' : userName;
-    lastError = '';
-    trace.clear();
-    _log('== 登录开始 host=$host user=$userName https=$useHttps ==');
-    if (password.isEmpty) {
-      lastError = '请填写管理密码';
-      return false;
-    }
-    await initSession();
-
-    final firstNonce = randomNonce();
-    final challengeBody =
-        '<?xml version="1.0" encoding="UTF-8"?><request>'
-        '<username>${escXml(user)}</username>'
-        '<firstnonce>$firstNonce</firstnonce>'
-        '<mode>1</mode>'
-        '<loginflag>2</loginflag></request>';
-    final challenge = await _rawPost('/api/user/challenge_login', challengeBody);
-    if (challenge == null) {
-      lastError = '无法连接设备';
-      await probeEndpoints();
-      return false;
-    }
-    if (challenge.statusCode != 200) {
-      lastError = '登录挑战失败（HTTP ${challenge.statusCode}）';
-      await probeEndpoints();
-      return false;
-    }
-
-    final d = tryParseXml(challenge.body);
-    final salt = tagOf(d, 'salt') ?? '';
-    final serverNonce = tagOf(d, 'servernonce') ?? '';
-    final iterations = int.tryParse(tagOf(d, 'iterations') ?? '') ?? 1000;
-    if (salt.isEmpty || serverNonce.isEmpty) {
-      lastError = '设备未返回 salt/servernonce';
-      await probeEndpoints();
-      return false;
-    }
-
-    final proof =
-        computeClientProof(password, salt, iterations, firstNonce, serverNonce);
-    final authBody =
-        '<?xml version="1.0" encoding="UTF-8"?><request>'
-        '<username>${escXml(user)}</username>'
-        '<clientproof>$proof</clientproof>'
-        '<finalnonce>$serverNonce</finalnonce>'
-        '<password_type>4</password_type></request>';
-    final auth = await _rawPost('/api/user/authentication_login', authBody);
-    if (auth == null) {
-      lastError = '登录请求未返回';
-      await probeEndpoints();
-      return false;
-    }
-
-    final body = auth.body;
-    _log('认证响应 ${auth.statusCode} | ${_head(body)}');
-    final ok = body.contains('<serversignature>') ||
-        (auth.statusCode == 200 && !body.contains('<code>'));
-    if (!ok) {
-      final code = tagOf(tryParseXml(body), 'code');
-      lastError = '密码或账号不正确${code != null ? '（$code）' : ''}';
-      loggedIn = false;
-      return false;
-    }
-
-    loggedIn = true;
-    await refreshToken();
-    return true;
-  }
-
-  /// 登录失败后跑一遍只读端点，确认哪些接口存在、是否需要鉴权
   Future<void> probeEndpoints() async {
     _log('== 只读探测 ==');
     const paths = [

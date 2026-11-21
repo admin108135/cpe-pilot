@@ -52,7 +52,7 @@ class _SmsPageState extends State<SmsPage> {
       _loading = false;
       _loadedOnce = true;
       if (list == null) {
-        _error = '短信接口无响应，可能该固件未开放短信功能';
+        _error = '短信接口无响应·去「抓包」页点「探测短信」看原始返回';
       } else {
         _items = list;
         _error = null;

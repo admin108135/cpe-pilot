@@ -3,6 +3,7 @@ import 'dart:io' as io;
 import 'package:flutter/material.dart';
 
 import 'app_state.dart';
+import 'pages/capture_page.dart';
 import 'pages/dashboard_page.dart';
 import 'pages/settings_page.dart';
 import 'pages/sms_page.dart';
@@ -66,6 +67,7 @@ class _RootShellState extends State<RootShell> {
               DashboardPage(),
               SmsPage(),
               SettingsPage(),
+              CapturePage(),
             ],
           ),
           bottomNavigationBar: _BottomBar(
@@ -94,6 +96,7 @@ class _BottomBar extends StatelessWidget {
     (Icons.dashboard_outlined, Icons.dashboard_rounded, '概览'),
     (Icons.chat_bubble_outline_rounded, Icons.chat_bubble_rounded, '短信'),
     (Icons.tune_rounded, Icons.tune_rounded, '设置'),
+    (Icons.receipt_long_outlined, Icons.receipt_long_rounded, '抓包'),
   ];
 
   @override
