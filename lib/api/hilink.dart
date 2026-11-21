@@ -259,16 +259,6 @@ class CpeClient {
     return h;
   }
 
-  void _absorbCookie(http.Response r) {
-    final raw = r.headers['set-cookie'];
-    if (raw == null || raw.isEmpty) return;
-    final pair = raw.split(';').first.trim();
-    if (pair.contains('=') && !pair.startsWith('expires')) {
-      cookie = pair;
-    }
-  }
-
-  /// 华为初始 token：`#` 分隔取首段；纯 hex 长串取后 32 位
   static String trimToken(String t) {
     if (t.isEmpty) return t;
     if (t.contains('#')) {
@@ -279,6 +269,16 @@ class CpeClient {
     }
     if (t.length > 32) return t.substring(32);
     return t;
+  }
+
+
+  void _absorbCookie(http.Response r) {
+    final raw = r.headers['set-cookie'];
+    if (raw == null || raw.isEmpty) return;
+    final pair = raw.split(';').first.trim();
+    if (pair.contains('=') && !pair.startsWith('expires')) {
+      cookie = pair;
+    }
   }
 
   Future<http.Response?> _rawGet(String path,
@@ -327,6 +327,101 @@ class CpeClient {
     }
   }
 
+  Future<void> initSession() async {
+    await _rawGet('/html/index.html', timeout: const Duration(seconds: 4));
+    await refreshToken();
+  }
+
+  Future<void> refreshToken() async {
+    final r1 = await _rawGet('/api/webserver/token');
+    if (r1 != null && r1.statusCode == 200) {
+      final t = tagOf(tryParseXml(r1.body), 'token');
+      if (t != null && t.isNotEmpty) token = trimToken(t);
+    }
+    if (token.isEmpty) {
+      final r2 = await _rawGet('/api/webserver/SesTokInfo');
+      if (r2 != null && r2.statusCode == 200) {
+        final d = tryParseXml(r2.body);
+        final ses = tagOf(d, 'SesInfo');
+        final tok = tagOf(d, 'TokInfo');
+        if (ses != null && ses.isNotEmpty && cookie.isEmpty) cookie = ses;
+        if (tok != null && tok.isNotEmpty) token = tok;
+      }
+    }
+  }
+
+  Future<bool> login(String userName, String password) async {
+    user = userName.isEmpty ? 'admin' : userName;
+    lastError = '';
+    trace.clear();
+    _log('== 登录开始 host=$host user=$userName https=$useHttps ==');
+    if (password.isEmpty) {
+      lastError = '请填写管理密码';
+      return false;
+    }
+    await initSession();
+
+    final firstNonce = randomNonce();
+    final challengeBody =
+        '<?xml version="1.0" encoding="UTF-8"?><request>'
+        '<username>${escXml(user)}</username>'
+        '<firstnonce>$firstNonce</firstnonce>'
+        '<mode>1</mode>'
+        '<loginflag>2</loginflag></request>';
+    final challenge = await _rawPost('/api/user/challenge_login', challengeBody);
+    if (challenge == null) {
+      lastError = '无法连接设备';
+      await probeEndpoints();
+      return false;
+    }
+    if (challenge.statusCode != 200) {
+      lastError = '登录挑战失败（HTTP ${challenge.statusCode}）';
+      await probeEndpoints();
+      return false;
+    }
+
+    final d = tryParseXml(challenge.body);
+    final salt = tagOf(d, 'salt') ?? '';
+    final serverNonce = tagOf(d, 'servernonce') ?? '';
+    final iterations = int.tryParse(tagOf(d, 'iterations') ?? '') ?? 1000;
+    if (salt.isEmpty || serverNonce.isEmpty) {
+      lastError = '设备未返回 salt/servernonce';
+      await probeEndpoints();
+      return false;
+    }
+
+    final proof =
+        computeClientProof(password, salt, iterations, firstNonce, serverNonce);
+    final authBody =
+        '<?xml version="1.0" encoding="UTF-8"?><request>'
+        '<username>${escXml(user)}</username>'
+        '<clientproof>$proof</clientproof>'
+        '<finalnonce>$serverNonce</finalnonce>'
+        '<password_type>4</password_type></request>';
+    final auth = await _rawPost('/api/user/authentication_login', authBody);
+    if (auth == null) {
+      lastError = '登录请求未返回';
+      await probeEndpoints();
+      return false;
+    }
+
+    final body = auth.body;
+    _log('认证响应 ${auth.statusCode} | ${_head(body)}');
+    final ok = body.contains('<serversignature>') ||
+        (auth.statusCode == 200 && !body.contains('<code>'));
+    if (!ok) {
+      final code = tagOf(tryParseXml(body), 'code');
+      lastError = '密码或账号不正确${code != null ? '（$code）' : ''}';
+      loggedIn = false;
+      return false;
+    }
+
+    loggedIn = true;
+    await refreshToken();
+    return true;
+  }
+
+  /// 登录失败后跑一遍只读端点，确认哪些接口存在、是否需要鉴权
   /// 短信专项探测：GET/POST 两种取法都打一遍，判断固件是否开放短信
   Future<void> probeSms() async {
     _log('== 短信接口探测 ==');
