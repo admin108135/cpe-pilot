@@ -56,24 +56,39 @@ List<int> pbkdf2HmacSha256(
 /// 华为 SCRAM-SHA256 变体：注意 HMAC 的 key/data 顺序与 RFC 相反
 String computeClientProof(String password, String saltHex, int iterations,
     String firstNonce, String serverNonce,
-    {bool standard = false}) {
+    {bool variant = false}) {
   final salted = pbkdf2HmacSha256(
       utf8.encode(password), hexDecode(saltHex), iterations, 32);
-  final clientKey =
-      Hmac(sha256, utf8.encode('Client Key')).convert(salted).bytes;
-  final storedKey = sha256.convert(clientKey).bytes;
   final authMessage = '$firstNonce,$serverNonce,$serverNonce';
-  final List<int> sig;
-  if (standard) {
-    // RFC 5802：HMAC(key=StoredKey, msg=AuthMessage)
-    sig = Hmac(sha256, storedKey).convert(utf8.encode(authMessage)).bytes;
+
+  List<int> clientKey;
+  List<int> signature;
+  if (variant) {
+    // 旧写法（key/msg 顺序相反），仅用于兼容其它固件
+    clientKey = Hmac(sha256, utf8.encode('Client Key')).convert(salted).bytes;
+    final storedKey = sha256.convert(clientKey).bytes;
+    signature = Hmac(sha256, utf8.encode(authMessage)).convert(storedKey).bytes;
   } else {
-    // 华为私有变体（INS2 已验证）：HMAC(key=AuthMessage, msg=StoredKey)
-    sig = Hmac(sha256, utf8.encode(authMessage)).convert(storedKey).bytes;
+    // 标准 SCRAM-SHA256（与 cpeultra 一致）
+    clientKey = Hmac(sha256, salted).convert(utf8.encode('Client Key')).bytes;
+    final storedKey = sha256.convert(clientKey).bytes;
+    signature = Hmac(sha256, storedKey).convert(utf8.encode(authMessage)).bytes;
   }
   final proof =
-      List<int>.generate(clientKey.length, (i) => clientKey[i] ^ sig[i]);
+      List<int>.generate(clientKey.length, (i) => clientKey[i] ^ signature[i]);
   return hexEncode(proof);
+}
+
+/// 服务器签名，用于校验对端身份（参考实现同款）
+String computeServerSignature(String password, String saltHex, int iterations,
+    String firstNonce, String serverNonce) {
+  final salted = pbkdf2HmacSha256(
+      utf8.encode(password), hexDecode(saltHex), iterations, 32);
+  final authMessage = '$firstNonce,$serverNonce,$serverNonce';
+  final serverKey =
+      Hmac(sha256, salted).convert(utf8.encode('Server Key')).bytes;
+  return hexEncode(
+      Hmac(sha256, serverKey).convert(utf8.encode(authMessage)).bytes);
 }
 
 String escXml(String s) => s
@@ -376,24 +391,29 @@ class CpeClient {
 
     final attempts = <String>[];
 
-    // 1. 华为私有变体 SCRAM（INS2 用这套）
-    final r1 = await _scramAttempt(password, standard: false);
-    attempts.add('变体SCRAM=${r1 ?? '成功'}');
+    // 1. cpeultra 同款：标准 SCRAM + 精简请求体（logintype=1）
+    final r1 = await _scramAttempt(password, modernBody: true, variant: false);
+    attempts.add('新版SCRAM=${r1 ?? '成功'}');
     if (r1 == null) return _loginDone(attempts);
 
-    // 2. 标准 SCRAM-SHA256
-    final r2 = await _scramAttempt(password, standard: true);
+    // 2. 标准 SCRAM + 旧请求体（username/password_type=4）
+    final r2 = await _scramAttempt(password, modernBody: false, variant: false);
     attempts.add('标准SCRAM=${r2 ?? '成功'}');
     if (r2 == null) return _loginDone(attempts);
 
-    // 3. 老式 /api/user/login（password_type=3, base64）
-    final r3 = await _legacyLogin(password);
-    attempts.add('老式登录=${r3 ?? '成功'}');
+    // 3. 旧写法 proof + 旧请求体
+    final r3 = await _scramAttempt(password, modernBody: false, variant: true);
+    attempts.add('旧proof=${r3 ?? '成功'}');
     if (r3 == null) return _loginDone(attempts);
 
+    // 4. 老式 /api/user/login
+    final r4 = await _legacyLogin(password);
+    attempts.add('老式登录=${r4 ?? '成功'}');
+    if (r4 == null) return _loginDone(attempts);
+
     loggedIn = false;
-    lastError = '三种方式均被拒（${attempts.join('、')}）'
-        '·大概率是管理密码不对，可先在浏览器里登录后台核对';
+    lastError = '四种方式均被拒（${attempts.join('、')}）'
+        '·如浏览器也登不上，就是管理密码不对';
     _log(lastError);
     return false;
   }
@@ -407,7 +427,7 @@ class CpeClient {
 
   /// 返回 null 表示成功，否则返回失败原因（错误码/状态）
   Future<String?> _scramAttempt(String password,
-      {required bool standard}) async {
+      {required bool modernBody, required bool variant}) async {
     final firstNonce = randomNonce();
     final challengeBody = '<?xml version="1.0" encoding="UTF-8"?><request>'
         '<username>${escXml(user)}</username>'
@@ -430,18 +450,29 @@ class CpeClient {
 
     final proof = computeClientProof(
         password, salt, iterations, firstNonce, serverNonce,
-        standard: standard);
-    final authBody = '<?xml version="1.0" encoding="UTF-8"?><request>'
-        '<username>${escXml(user)}</username>'
-        '<clientproof>$proof</clientproof>'
-        '<finalnonce>$serverNonce</finalnonce>'
-        '<password_type>4</password_type></request>';
+        variant: variant);
+
+    final authBody = modernBody
+        ? '<?xml version="1.0" encoding="UTF-8"?><request>'
+            '<clientproof>$proof</clientproof>'
+            '<finalnonce>$serverNonce</finalnonce>'
+            '<logintype>1</logintype></request>'
+        : '<?xml version="1.0" encoding="UTF-8"?><request>'
+            '<username>${escXml(user)}</username>'
+            '<clientproof>$proof</clientproof>'
+            '<finalnonce>$serverNonce</finalnonce>'
+            '<password_type>4</password_type></request>';
+
     final auth =
         await _rawPost('/api/user/authentication_login', authBody);
     if (auth == null) return '无响应';
 
     final body = auth.body;
     if (auth.statusCode == 200 && !body.contains('<code>')) {
+      final sig = computeServerSignature(
+          password, salt, iterations, firstNonce, serverNonce);
+      final got = tagOf(tryParseXml(body), 'serversignature');
+      _log('服务器签名 ${got == sig ? '校验通过' : '不一致'}');
       await refreshToken();
       return null;
     }
