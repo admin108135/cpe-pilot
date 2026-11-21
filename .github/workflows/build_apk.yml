@@ -1,0 +1,55 @@
+name: Build CPE Pilot APK
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.19.0'
+          channel: 'stable'
+
+      - name: Assemble project
+        run: |
+          mkdir temp_project
+          cd temp_project
+          flutter create --org com.tdtech --project-name cpe_pilot --android-language kotlin .
+          cp -f ../pubspec.yaml ./pubspec.yaml
+          rm -rf ./lib
+          mkdir -p ./lib
+          cp -rf ../lib/. ./lib/
+          cp -f ../android/app/src/main/AndroidManifest.xml ./android/app/src/main/AndroidManifest.xml
+          mkdir -p ./android/app/src/main/kotlin/com/tdtech/cpe_pilot
+          cp -f ../android/app/src/main/kotlin/com/tdtech/cpe_pilot/MainActivity.kt ./android/app/src/main/kotlin/com/tdtech/cpe_pilot/MainActivity.kt
+
+      - name: Build launcher icons
+        run: |
+          python3 -m pip install --quiet pillow
+          python3 tools/make_icons.py assets/icon.png temp_project/android/app/src/main/res
+
+      - name: Build APK
+        run: |
+          cd temp_project
+          flutter pub get
+          flutter build apk --release
+
+      - name: Upload Release APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: CPE-Pilot-APK
+          path: temp_project/build/app/outputs/flutter-apk/app-release.apk
