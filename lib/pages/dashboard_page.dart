@@ -345,6 +345,36 @@ class _DashboardPageState extends State<DashboardPage> {
                   style: const TextStyle(
                       fontSize: 12.5, color: AppColors.danger)),
             ),
+            const SizedBox(height: 8),
+            Row(children: [
+              const Icon(Icons.bug_report_outlined,
+                  size: 15, color: AppColors.textMuted),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text('登录不上多半是这版固件的鉴权方式不同',
+                    style:
+                        TextStyle(fontSize: 11.5, color: AppColors.textMuted)),
+              ),
+              TextButton(
+                onPressed: () {
+                  final text = '地址: ${_app.host}\n'
+                      '错误: ${_app.message}\n\n'
+                      '--- 请求轨迹 ---\n'
+                      '${_app.client.traceText}';
+                  Clipboard.setData(ClipboardData(text: text));
+                  HapticFeedback.lightImpact();
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('诊断信息已复制，粘贴发我即可')),
+                  );
+                },
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                child: const Text('复制诊断', style: TextStyle(fontSize: 12)),
+              ),
+            ]),
           ],
           const SizedBox(height: 12),
           const Text('提示：手机需先连上该 CPE 的 Wi-Fi',

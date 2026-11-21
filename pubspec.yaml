@@ -1,7 +1,7 @@
 name: cpe_pilot
 description: CPE 管家 - 华为 HiLink 系列 5G CPE 的信号、短信与锁频管理工具
 publish_to: 'none'
-version: 1.0.0+1
+version: 1.0.1+2
 
 environment:
   sdk: '>=3.0.0 <4.0.0'

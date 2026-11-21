@@ -156,6 +156,21 @@ class CpeClient {
   String lastError = '';
   String user = 'admin';
 
+  /// 诊断轨迹：记录每一步请求的状态码与响应片段，便于排查协议差异
+  final List<String> trace = [];
+
+  void _log(String msg) {
+    if (trace.length >= 90) trace.removeAt(0);
+    trace.add(msg);
+  }
+
+  static String _head(String s, [int n = 260]) {
+    final flat = s.replaceAll(RegExp(r'\s+'), ' ');
+    return flat.length <= n ? flat : '${flat.substring(0, n)}…';
+  }
+
+  String get traceText => trace.join('\n');
+
   static const _ua =
       'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
 
@@ -199,8 +214,10 @@ class CpeClient {
           .get(Uri.parse('$baseUrl$path'), headers: _headers)
           .timeout(timeout);
       _absorbCookie(r);
+      _log('GET $path → ${r.statusCode} | ${_head(r.body)}');
       return r;
     } catch (e) {
+      _log('GET $path → 异常: $e');
       lastError = '$e';
       return null;
     }
@@ -217,8 +234,10 @@ class CpeClient {
           .post(Uri.parse('$baseUrl$path'), headers: h, body: body)
           .timeout(timeout);
       _absorbCookie(r);
+      _log('POST $path → ${r.statusCode} | 请求 ${_head(body, 160)} | 响应 ${_head(r.body)}');
       return r;
     } catch (e) {
+      _log('POST $path → 异常: $e');
       lastError = '$e';
       return null;
     }
@@ -252,6 +271,8 @@ class CpeClient {
   Future<bool> login(String userName, String password) async {
     user = userName.isEmpty ? 'admin' : userName;
     lastError = '';
+    trace.clear();
+    _log('== 登录开始 host=$host user=$userName https=$useHttps ==');
     if (password.isEmpty) {
       lastError = '请填写管理密码';
       return false;
@@ -268,10 +289,12 @@ class CpeClient {
     final challenge = await _rawPost('/api/user/challenge_login', challengeBody);
     if (challenge == null) {
       lastError = '无法连接设备';
+      await probeEndpoints();
       return false;
     }
     if (challenge.statusCode != 200) {
       lastError = '登录挑战失败（HTTP ${challenge.statusCode}）';
+      await probeEndpoints();
       return false;
     }
 
@@ -281,6 +304,7 @@ class CpeClient {
     final iterations = int.tryParse(tagOf(d, 'iterations') ?? '') ?? 1000;
     if (salt.isEmpty || serverNonce.isEmpty) {
       lastError = '设备未返回 salt/servernonce';
+      await probeEndpoints();
       return false;
     }
 
@@ -295,9 +319,11 @@ class CpeClient {
     final auth = await _rawPost('/api/user/authentication_login', authBody);
     if (auth == null) {
       lastError = '登录请求未返回';
+      await probeEndpoints();
       return false;
     }
 
+    _log('认证响应 ${auth.statusCode} | ${_head(body)}');
     final body = auth.body;
     final ok = body.contains('<serversignature>') ||
         (auth.statusCode == 200 && !body.contains('<code>'));
@@ -311,6 +337,22 @@ class CpeClient {
     loggedIn = true;
     await refreshToken();
     return true;
+  }
+
+  /// 登录失败后跑一遍只读端点，确认哪些接口存在、是否需要鉴权
+  Future<void> probeEndpoints() async {
+    _log('== 只读探测 ==');
+    const paths = [
+      '/api/device/information',
+      '/api/device/signal',
+      '/api/monitoring/status',
+      '/api/net/net-mode',
+      '/api/sms/sms-count',
+      '/api/sms/sms-list',
+    ];
+    for (final p in paths) {
+      await _rawGet(p, timeout: const Duration(seconds: 3));
+    }
   }
 
   // ---- 通用读取 ------------------------------------------------------------
