@@ -323,8 +323,8 @@ class CpeClient {
       return false;
     }
 
-    _log('认证响应 ${auth.statusCode} | ${_head(body)}');
     final body = auth.body;
+    _log('认证响应 ${auth.statusCode} | ${_head(body)}');
     final ok = body.contains('<serversignature>') ||
         (auth.statusCode == 200 && !body.contains('<code>'));
     if (!ok) {
