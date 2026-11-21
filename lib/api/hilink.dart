@@ -303,10 +303,16 @@ class CpeClient {
 
   void _absorbCookie(http.Response r) {
     final raw = r.headers['set-cookie'];
-    if (raw == null || raw.isEmpty) return;
-    final pair = raw.split(';').first.trim();
-    // 只接受会话 cookie，避免被无关 Set-Cookie 覆盖
-    if (pair.startsWith('SessionID=')) cookie = pair;
+    if (raw != null && raw.isNotEmpty) {
+      final pair = raw.split(';').first.trim();
+      // 只接受会话 cookie，避免被无关 Set-Cookie 覆盖
+      if (pair.startsWith('SessionID=')) cookie = pair;
+    }
+    // 新版 WebUI 会把 CSRF token 放在响应头里，优先级高于 body
+    final tok = r.headers['__requestverificationtoken'];
+    if (tok != null && tok.trim().isNotEmpty) {
+      token = trimToken(tok.trim());
+    }
   }
 
   Future<http.Response?> _rawGet(String path,
@@ -356,6 +362,7 @@ class CpeClient {
   }
 
   Future<void> initSession() async {
+    await _rawGet('/', timeout: const Duration(seconds: 4));
     await _rawGet('/html/index.html', timeout: const Duration(seconds: 4));
     final ok = await refreshSesTok();
     if (!ok) {
