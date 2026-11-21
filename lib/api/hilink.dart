@@ -55,14 +55,24 @@ List<int> pbkdf2HmacSha256(
 
 /// 华为 SCRAM-SHA256 变体：注意 HMAC 的 key/data 顺序与 RFC 相反
 String computeClientProof(String password, String saltHex, int iterations,
-    String firstNonce, String serverNonce) {
-  final salted = pbkdf2HmacSha256(password.codeUnits, hexDecode(saltHex), iterations, 32);
-  final clientKey = Hmac(sha256, utf8.encode('Client Key')).convert(salted).bytes;
+    String firstNonce, String serverNonce,
+    {bool standard = false}) {
+  final salted = pbkdf2HmacSha256(
+      utf8.encode(password), hexDecode(saltHex), iterations, 32);
+  final clientKey =
+      Hmac(sha256, utf8.encode('Client Key')).convert(salted).bytes;
   final storedKey = sha256.convert(clientKey).bytes;
   final authMessage = '$firstNonce,$serverNonce,$serverNonce';
-  final authKey = Hmac(sha256, utf8.encode(authMessage)).convert(storedKey).bytes;
-  final proof = List<int>.generate(
-      clientKey.length, (i) => clientKey[i] ^ authKey[i]);
+  final List<int> sig;
+  if (standard) {
+    // RFC 5802：HMAC(key=StoredKey, msg=AuthMessage)
+    sig = Hmac(sha256, storedKey).convert(utf8.encode(authMessage)).bytes;
+  } else {
+    // 华为私有变体（INS2 已验证）：HMAC(key=AuthMessage, msg=StoredKey)
+    sig = Hmac(sha256, utf8.encode(authMessage)).convert(storedKey).bytes;
+  }
+  final proof =
+      List<int>.generate(clientKey.length, (i) => clientKey[i] ^ sig[i]);
   return hexEncode(proof);
 }
 
@@ -267,7 +277,9 @@ class CpeClient {
       }
       return t;
     }
-    if (t.length > 32) return t.substring(32);
+    // 老固件返回纯十六进制长串，取后 32 位；新版固件返回 base64 完整 token，原样使用
+    final isHex = RegExp(r'^[0-9a-fA-F]+$').hasMatch(t);
+    if (isHex && t.length > 32) return t.substring(32);
     return t;
   }
 
@@ -360,68 +372,99 @@ class CpeClient {
       return false;
     }
     await initSession();
+    _log('token 长度 ${token.length}');
 
+    final attempts = <String>[];
+
+    // 1. 华为私有变体 SCRAM（INS2 用这套）
+    final r1 = await _scramAttempt(password, standard: false);
+    attempts.add('变体SCRAM=${r1 ?? '成功'}');
+    if (r1 == null) return _loginDone(attempts);
+
+    // 2. 标准 SCRAM-SHA256
+    final r2 = await _scramAttempt(password, standard: true);
+    attempts.add('标准SCRAM=${r2 ?? '成功'}');
+    if (r2 == null) return _loginDone(attempts);
+
+    // 3. 老式 /api/user/login（password_type=3, base64）
+    final r3 = await _legacyLogin(password);
+    attempts.add('老式登录=${r3 ?? '成功'}');
+    if (r3 == null) return _loginDone(attempts);
+
+    loggedIn = false;
+    lastError = '三种方式均被拒（${attempts.join('、')}）'
+        '·大概率是管理密码不对，可先在浏览器里登录后台核对';
+    _log(lastError);
+    return false;
+  }
+
+  bool _loginDone(List<String> attempts) {
+    loggedIn = true;
+    lastError = '';
+    _log('登录成功，方式: ${attempts.join('、')}');
+    return true;
+  }
+
+  /// 返回 null 表示成功，否则返回失败原因（错误码/状态）
+  Future<String?> _scramAttempt(String password,
+      {required bool standard}) async {
     final firstNonce = randomNonce();
-    final challengeBody =
-        '<?xml version="1.0" encoding="UTF-8"?><request>'
+    final challengeBody = '<?xml version="1.0" encoding="UTF-8"?><request>'
         '<username>${escXml(user)}</username>'
         '<firstnonce>$firstNonce</firstnonce>'
         '<mode>1</mode>'
         '<loginflag>2</loginflag></request>';
-    final challenge = await _rawPost('/api/user/challenge_login', challengeBody);
-    if (challenge == null) {
-      lastError = '无法连接设备';
-      await probeEndpoints();
-      return false;
-    }
-    if (challenge.statusCode != 200) {
-      lastError = '登录挑战失败（HTTP ${challenge.statusCode}）';
-      await probeEndpoints();
-      return false;
-    }
+    final challenge =
+        await _rawPost('/api/user/challenge_login', challengeBody);
+    if (challenge == null) return '无响应';
+    if (challenge.statusCode != 200) return 'HTTP ${challenge.statusCode}';
 
     final d = tryParseXml(challenge.body);
+    final preCode = tagOf(d, 'code');
+    if (preCode != null && preCode.isNotEmpty) return '挑战$preCode';
+
     final salt = tagOf(d, 'salt') ?? '';
     final serverNonce = tagOf(d, 'servernonce') ?? '';
     final iterations = int.tryParse(tagOf(d, 'iterations') ?? '') ?? 1000;
-    if (salt.isEmpty || serverNonce.isEmpty) {
-      lastError = '设备未返回 salt/servernonce';
-      await probeEndpoints();
-      return false;
-    }
+    if (salt.isEmpty || serverNonce.isEmpty) return '无salt';
 
-    final proof =
-        computeClientProof(password, salt, iterations, firstNonce, serverNonce);
-    final authBody =
-        '<?xml version="1.0" encoding="UTF-8"?><request>'
+    final proof = computeClientProof(
+        password, salt, iterations, firstNonce, serverNonce,
+        standard: standard);
+    final authBody = '<?xml version="1.0" encoding="UTF-8"?><request>'
         '<username>${escXml(user)}</username>'
         '<clientproof>$proof</clientproof>'
         '<finalnonce>$serverNonce</finalnonce>'
         '<password_type>4</password_type></request>';
-    final auth = await _rawPost('/api/user/authentication_login', authBody);
-    if (auth == null) {
-      lastError = '登录请求未返回';
-      await probeEndpoints();
-      return false;
-    }
+    final auth =
+        await _rawPost('/api/user/authentication_login', authBody);
+    if (auth == null) return '无响应';
 
     final body = auth.body;
-    _log('认证响应 ${auth.statusCode} | ${_head(body)}');
-    final ok = body.contains('<serversignature>') ||
-        (auth.statusCode == 200 && !body.contains('<code>'));
-    if (!ok) {
-      final code = tagOf(tryParseXml(body), 'code');
-      lastError = '密码或账号不正确${code != null ? '（$code）' : ''}';
-      loggedIn = false;
-      return false;
+    if (auth.statusCode == 200 && !body.contains('<code>')) {
+      await refreshToken();
+      return null;
     }
-
-    loggedIn = true;
-    await refreshToken();
-    return true;
+    final code = tagOf(tryParseXml(body), 'code');
+    return code ?? 'HTTP ${auth.statusCode}';
   }
 
-  /// 登录失败后跑一遍只读端点，确认哪些接口存在、是否需要鉴权
+  Future<String?> _legacyLogin(String password) async {
+    final pwd64 = base64Encode(utf8.encode(password));
+    final body = '<?xml version="1.0" encoding="UTF-8"?><request>'
+        '<Username>${escXml(user)}</Username>'
+        '<Password>$pwd64</Password>'
+        '<password_type>3</password_type></request>';
+    final r = await _rawPost('/api/user/login', body);
+    if (r == null) return '无响应';
+    if (r.statusCode == 200 && !r.body.contains('<code>')) {
+      await refreshToken();
+      return null;
+    }
+    final code = tagOf(tryParseXml(r.body), 'code');
+    return code ?? 'HTTP ${r.statusCode}';
+  }
+
   /// 短信专项探测：GET/POST 两种取法都打一遍，判断固件是否开放短信
   Future<void> probeSms() async {
     _log('== 短信接口探测 ==');
